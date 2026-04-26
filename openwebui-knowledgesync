@@ -62,6 +62,18 @@ function fileHash(filename) {
     return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+// Helper: wait for file processing to complete (hash becomes non-null)
+async function waitForFileProcessing(fileId, timeoutMs = 30000) {
+    const pollInterval = 1000;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const file = await httpRequest('GET', `/api/v1/files/${fileId}`);
+        if (file.hash !== null && file.hash !== undefined) return file;
+        await new Promise(r => setTimeout(r, pollInterval));
+    }
+    throw new Error(`File ${fileId} did not finish processing within ${timeoutMs / 1000}s`);
+}
+
 // Helper: make HTTP request returning JSON or raw data
 function httpRequest(method, apiPath, body = null, contentType = 'application/json', parseJson = true) {
     return new Promise((resolve, reject) => {
@@ -142,9 +154,14 @@ function uploadFile(filename, kbdirId) {
         // Encode filename with kbdir_id prefix
         const encodedFilename = encodeFilename(filename, kbdirId);
 
+        const ext = path.extname(filename).toLowerCase();
+        const contentTypeMap = { '.md': 'text/markdown', '.txt': 'text/plain', '.pdf': 'application/pdf' };
+        const fileContentType = contentTypeMap[ext] || 'application/octet-stream';
+
         const payloadStart = Buffer.from(
             `--${boundary}\r\n` +
-            `Content-Disposition: form-data; name="file"; filename="${encodedFilename}"\r\n\r\n`
+            `Content-Disposition: form-data; name="file"; filename="${encodedFilename}"\r\n` +
+            `Content-Type: ${fileContentType}\r\n\r\n`
         );
         const payloadEnd = Buffer.from(`\r\n--${boundary}--\r\n`);
         const contentLength = payloadStart.length + fileContent.length + payloadEnd.length;
@@ -207,7 +224,8 @@ async function removeFileFromKnowledgeBase(fileId) {
 function listKnowledgeBases() {
     httpRequest('GET', '/api/v1/knowledge/')
         .then(json => {
-            const simplified = json.map(kb => ({
+            const items = Array.isArray(json) ? json : (json.items || []);
+            const simplified = items.map(kb => ({
                 id: kb.id,
                 name: kb.name,
                 description: kb.description
@@ -256,7 +274,8 @@ async function syncKnowledgeBase() {
         }
 
         // 3. Get all files to find hash information and build maps for reuse
-        const allFiles = await httpRequest('GET', '/api/v1/files/');
+        const allFilesResponse = await httpRequest('GET', '/api/v1/files/');
+        const allFiles = Array.isArray(allFilesResponse) ? allFilesResponse : (allFilesResponse.items || []);
         const fileHashMap = {};
         const fileByNameAndHash = new Map(); // Map for reusing existing files
         const fileIdByDecodedName = new Map(); // Map to track file IDs by decoded name
@@ -335,8 +354,10 @@ async function syncKnowledgeBase() {
                 console.log(`- Hash match: ${localHash === remoteHash ? 'YES' : 'NO'}`);
             }
 
-            // Check if file needs to be uploaded
-            if (!fileInKb || localHash !== remoteHash) {
+            // Check if file needs to be uploaded.
+            // remoteHash is undefined when the server hasn't finished processing (hash: null),
+            // so skip re-upload in that case to avoid re-uploading already-linked files.
+            if (!fileInKb || (remoteHash !== undefined && localHash !== remoteHash)) {
                 let fileId = null;
                 const encodedFilename = encodeFilename(filename, kbdirId);
                 const reuseKey = `${encodedFilename}:${localHash}`;
@@ -367,6 +388,17 @@ async function syncKnowledgeBase() {
                     }
                     fileId = uploadResult.id;
                     console.log(`File uploaded successfully: ${filename} (${fileId})`);
+
+                    // Wait for server-side processing to complete before adding to KB,
+                    // otherwise ChromaDB rejects null metadata values.
+                    if (uploadResult.hash === null) {
+                        console.log(`Waiting for file processing: ${filename}`);
+                        try {
+                            await waitForFileProcessing(fileId);
+                        } catch (e) {
+                            console.error(`Warning: ${e.message} — proceeding anyway`);
+                        }
+                    }
                 }
 
                 // Add file to knowledge base
