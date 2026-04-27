@@ -35,7 +35,8 @@ assuming you have a `bin` directory in your home folder:
 
 ```bash
 git clone https://github.com/hyrness/openwebui-knowledgesync.git
-ln -s openwebui-knowledgesync/openwebui-knowledgesync $HOME/bin/openwebui-knowledgesync
+cd openwebui-knowledgesync
+ln -s "$(pwd)/openwebui-knowledgesync" "$HOME/bin/openwebui-knowledgesync"
 ```
 
 ## Setup Process
