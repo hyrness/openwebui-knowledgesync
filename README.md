@@ -1,22 +1,6 @@
 # OpenWebUI Knowledge Sync
 
-A command-line tool to synchronize local directories with [OpenWebUI](https://docs.openwebui.com/)
-knowledge bases: use an AI for your local knowledge without uploading files to a public service.
-
-Each directory can be synchronized to its own knowledge base (one on one relationship!), 
-keeping your knowledge collections in sync with your local file system automatically. 
-I've got several directories with knowledge files where I write down
-stuff, and a cron job runs this tool periodically to keep the corresponding knowledge bases up to date.
-
-I developed that since I need to query knowledge I have in markdown files which
-I don't want or cannot upload into public services like an OpenAI GPT / assistant but rather want to keep only locally.
-For that OpenWebUI is great, but having to drag and drop files into the web interface is cumbersome, but, as of
-7/25, OpenWebUI does not have tool to support synchronizing directories with knowledge bases anymore.
-I'm using OpenWebUI together with local models running on [LM Studio](https://lmstudio.ai/).
-
-Caution: this is vibe-coded in the sense that I wrote the specifications but hardly even studied the code, so this is not
-representative for my professional coding skills. :-) I just needed something quick that works good enough. Even most of
-this README is vibe-coded.
+CLI tool to sync local directories with [OpenWebUI](https://docs.openwebui.com/) knowledge bases. Each directory maps to one knowledge base; run it from cron to keep your collections in sync automatically.
 
 ## Features
 
