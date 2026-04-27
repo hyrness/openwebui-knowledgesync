@@ -34,7 +34,7 @@ Clone the repository and link the script to your PATH for easy access,
 assuming you have a `bin` directory in your home folder:
 
 ```bash
-git clone https://github.com/your-username/openwebui-knowledgesync.git
+git clone https://github.com/hyrness/openwebui-knowledgesync.git
 ln -s openwebui-knowledgesync/openwebui-knowledgesync $HOME/bin/openwebui-knowledgesync
 ```
 
@@ -102,6 +102,12 @@ came from.
 ```bash
 # Synchronize current directory with knowledge base. This is the main command, the rest is for setup / debugging.
 openwebui-knowledgesync sync
+
+# Preview what would change without making any modifications
+openwebui-knowledgesync sync --dry-run
+
+# Sync a single file only (no deletions)
+openwebui-knowledgesync sync path/to/file.md
 
 # List all available knowledge bases
 openwebui-knowledgesync listkb
@@ -176,11 +182,21 @@ openwebui-knowledgesync sync
 ### Synchronization Process
 
 1. **Scan local files** matching the regex pattern
-2. **Fetch knowledge base** content and filter by `kbdir_id`
-3. **Compare hashes** to identify changes
-4. **Remove outdated files** belonging to this directory
-5. **Upload new/changed files** with deduplication
-6. **Add files to collection** and verify success
+2. **Load local sync state** from `.sync-state` (records the hash of each file at last sync)
+3. **Fetch knowledge base** file list
+4. **Remove files** from the KB that no longer exist locally
+5. **Upload new/changed files** — a file is considered changed when its current local hash differs from the hash recorded in `.sync-state`
+6. **Add files to collection** and update `.sync-state`
+
+Change detection is based on the local `.sync-state` file rather than OpenWebUI's stored hash,
+because OpenWebUI computes hashes from extracted text content (via LangChain TextLoader) which
+can differ from the raw file bytes depending on encoding detection.
+
+### State File
+
+Each synced directory contains a `.sync-state` file that maps filenames to their last-synced local
+hash. This file is managed automatically — do not edit it manually. On first run, all files already
+present in the knowledge base are recorded as synced to avoid unnecessary re-uploads.
 
 ## Requirements
 
@@ -200,14 +216,6 @@ Configuration file not found: /path/to/.open-webui-knowledgesync
 
 Ensure the configuration file exists in your current directory.
 
-**Hash mismatch warnings**
-
-```bash
-Hash mismatch for uploaded file: local vs uploaded hash different
-```
-
-This may indicate file encoding issues. Ensure files are valid UTF-8.
-
 **Upload failures**
 
 ```bash
@@ -215,6 +223,11 @@ Upload failed: No file ID in response
 ```
 
 Check your API key permissions and OpenWebUI instance connectivity.
+
+**Files being re-uploaded unexpectedly**
+
+Delete the `.sync-state` file in your directory and re-run sync. On first run without a state file,
+all files already in the knowledge base are recorded as synced without re-uploading.
 
 ### Debug Mode
 
@@ -232,12 +245,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 - [OpenWebUI](https://github.com/open-webui/open-webui) - The main OpenWebUI project
 - [OpenWebUI Documentation](https://docs.openwebui.com/) - Official documentation
-
-## Bugs
-
-It seems the sha256 calculation of OpenWebUI is somehow different than
-this in some cases. That means the file will be uploaded again each time.
-I don't know how that can be fixed at the moment.
 
 ---
 

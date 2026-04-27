@@ -13,9 +13,11 @@ const debug = false; // Set to true for debug output
 function usage() {
     console.log('Usage: openwebui-knowledgesync [command]');
     console.log('Commands:');
-    console.log('  sync         Performs the synchronization of the configured knowledge base with the current directory.');
-    console.log('               All files in the knowledge base that do not correspond to files in the current directory will be deleted.');
-    console.log('               All files in the current directory will be uploaded / changed if needed.');
+    console.log('  sync [file]         Performs the synchronization of the configured knowledge base with the current directory.');
+    console.log('                      All files in the knowledge base that do not correspond to files in the current directory will be deleted.');
+    console.log('                      All files in the current directory will be uploaded / changed if needed.');
+    console.log('                      If [file] is specified, only that file is synced (no deletions).');
+    console.log('  sync --dry-run       Show what would be changed without actually doing anything.');
     console.log('  listkb       List knowledge bases');
     console.log('  listfiles    List all files');
     console.log('  listkbfiles  List files in a knowledge base');
@@ -56,26 +58,56 @@ function getLocalFiles(dir = process.cwd(), relativePath = '', regexPattern = nu
     return files;
 }
 
-// Helper: compute SHA256 hash of file
+// Helper: compute SHA256 hash of file, matching OpenWebUI's calculation:
+// read as UTF-8 string, hash the UTF-8 re-encoding (equivalent to Python's
+// sha256(text_content.encode('utf-8')) via TextLoader).
 function fileHash(filename) {
-    const data = fs.readFileSync(filename);
-    return crypto.createHash('sha256').update(data).digest('hex');
+    const content = fs.readFileSync(filename, 'utf-8');
+    return crypto.createHash('sha256').update(content, 'utf-8').digest('hex');
 }
 
-// Helper: wait for file processing to complete (hash becomes non-null)
+// Helper: wait for file processing to complete via dedicated status endpoint.
+// Falls back to polling the file metadata (hash != null) for older OpenWebUI versions.
 async function waitForFileProcessing(fileId, timeoutMs = 30000) {
     const pollInterval = 1000;
     const deadline = Date.now() + timeoutMs;
+    let useStatusEndpoint = true;
     while (Date.now() < deadline) {
-        const file = await httpRequest('GET', `/api/v1/files/${fileId}`);
-        if (file.hash !== null && file.hash !== undefined) return file;
+        if (useStatusEndpoint) {
+            const status = await httpRequest('GET', `/api/v1/files/${fileId}/process/status`);
+            if (typeof status === 'string' || status.detail) {
+                // Endpoint not available on this version — fall back
+                useStatusEndpoint = false;
+                continue;
+            }
+            if (status.status === 'completed') return status;
+            if (status.status === 'failed') throw new Error(`File processing failed: ${status.error || 'unknown error'}`);
+        } else {
+            const file = await httpRequest('GET', `/api/v1/files/${fileId}`);
+            if (file.hash !== null && file.hash !== undefined) return file;
+        }
         await new Promise(r => setTimeout(r, pollInterval));
     }
     throw new Error(`File ${fileId} did not finish processing within ${timeoutMs / 1000}s`);
 }
 
+// Helper: retry an async function with exponential backoff on network errors
+async function withRetry(fn, label, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            const retryable = err.code && ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EHOSTUNREACH'].includes(err.code);
+            if (!retryable || attempt === maxRetries) throw err;
+            const waitMs = 2000 * Math.pow(2, attempt - 1);
+            console.warn(`${label}: network error (${err.code}), retrying in ${waitMs / 1000}s... (attempt ${attempt}/${maxRetries})`);
+            await new Promise(r => setTimeout(r, waitMs));
+        }
+    }
+}
+
 // Helper: make HTTP request returning JSON or raw data
-function httpRequest(method, apiPath, body = null, contentType = 'application/json', parseJson = true) {
+function httpRequestRaw(method, apiPath, body = null, contentType = 'application/json', parseJson = true) {
     return new Promise((resolve, reject) => {
         const url = new URL(apiPath, openWebuiApiUrl);
         const lib = url.protocol === 'https:' ? https : http;
@@ -107,6 +139,7 @@ function httpRequest(method, apiPath, body = null, contentType = 'application/js
                 }
                 res.pipe(process.stdout);
                 res.on('end', () => resolve());
+                res.on('error', reject);
                 return;
             }
 
@@ -120,12 +153,20 @@ function httpRequest(method, apiPath, body = null, contentType = 'application/js
                     resolve(data);
                 }
             });
+            res.on('error', reject);
         });
 
         req.on('error', reject);
         if (body) req.write(body);
         req.end();
     });
+}
+
+function httpRequest(method, apiPath, body = null, contentType = 'application/json', parseJson = true) {
+    return withRetry(
+        () => httpRequestRaw(method, apiPath, body, contentType, parseJson),
+        `${method} ${apiPath}`
+    );
 }
 
 // Helper: encode filename with kbdir_id prefix and %% separators
@@ -145,6 +186,10 @@ function decodeFilename(encodedName, kbdirId) {
 
 // Helper: upload file using multipart form data
 function uploadFile(filename, kbdirId) {
+    return withRetry(() => uploadFileRaw(filename, kbdirId), `upload ${filename}`);
+}
+
+function uploadFileRaw(filename, kbdirId) {
     return new Promise((resolve, reject) => {
         const boundary = '----WebKitFormBoundary' + Math.random().toString(16).slice(2);
         const url = new URL('/api/v1/files/', openWebuiApiUrl);
@@ -189,6 +234,7 @@ function uploadFile(filename, kbdirId) {
                     reject(e);
                 }
             });
+            res.on('error', reject);
         });
 
         req.on('error', reject);
@@ -202,8 +248,6 @@ function uploadFile(filename, kbdirId) {
 // Helper: remove file from knowledge base (first from collection, then from storage)
 async function removeFileFromKnowledgeBase(fileId) {
     try {
-        // First remove from knowledge collection
-        console.log(`Removing file ${fileId} from knowledge collection...`);
         const removeUrl = `/api/v1/knowledge/${knowledgeBaseId}/file/remove`;
         const kbremoveresponse = await httpRequest('POST', removeUrl, {'file_id': fileId});
         if (!kbremoveresponse?.id) {
@@ -247,193 +291,176 @@ function listFilesInKnowledgeBase(id) {
         .catch(err => console.error('Request error:', err.message));
 }
 
-async function syncKnowledgeBase() {
+async function syncKnowledgeBase(singleFile = null, dryRun = false) {
     try {
-        console.log('Starting knowledge base synchronization...');
+        if (dryRun) console.log('DRY RUN — no changes will be made.');
+        if (singleFile) {
+            console.log(`Starting single-file sync: ${singleFile}`);
+        } else {
+            console.log('Starting knowledge base synchronization...');
+        }
 
-        // 1. Get local files and their hashes - now using fileRegex
-        const localFiles = getLocalFiles(process.cwd(), '', fileRegex);
+        // 1. Get local files and their hashes
+        let localFiles = getLocalFiles(process.cwd(), '', fileRegex);
+        if (singleFile) {
+            if (!localFiles.includes(singleFile)) {
+                console.error(`File not found (or excluded by fileregex): ${singleFile}`);
+                process.exit(1);
+            }
+            localFiles = [singleFile];
+        }
         const localHashes = {};
         for (const filename of localFiles) {
             localHashes[filename] = fileHash(filename);
         }
-        console.log(`Found ${localFiles.length} local files.`);
+        if (!singleFile) console.log(`Found ${localFiles.length} local files.`);
 
-        // 2. Get current knowledge base state
-        const kbData = await httpRequest('GET', `/api/v1/knowledge/${knowledgeBaseId}`);
-        const kbFiles = kbData.files || [];
+        // 2. Load local sync state: records the local hash at last successful sync.
+        // This avoids relying on OpenWebUI's hash (which is computed differently via TextLoader).
+        const statePath = path.join(process.cwd(), '.sync-state');
+        let syncState = {};
+        if (fs.existsSync(statePath)) {
+            try {
+                syncState = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+            } catch (e) {
+                console.warn('Warning: could not read .sync-state, starting fresh');
+            }
+        }
+
+        // 3. Get current knowledge base state via paginated /api/v1/knowledge/{id}/files
+        const kbFiles = [];
+        {
+            let page = 1;
+            while (true) {
+                const res = await httpRequest('GET', `/api/v1/knowledge/${knowledgeBaseId}/files?page=${page}`);
+                const items = res.items || [];
+                if (items.length === 0) break;
+                kbFiles.push(...items);
+                page++;
+            }
+        }
         console.log(`Knowledge base contains ${kbFiles.length} files.`);
 
-        // Debug: log KB files with their decoded names
-        if (debug) {
-            console.log('Knowledge base files:');
-            kbFiles.forEach(file => {
-                const decodedName = decodeFilename(file.meta.name, kbdirId);
-                console.log(`- ${file.id}: ${file.meta.name} -> ${decodedName}`);
-            });
-        }
-
-        // 3. Get all files to find hash information and build maps for reuse
-        const allFilesResponse = await httpRequest('GET', '/api/v1/files/');
-        const allFiles = Array.isArray(allFilesResponse) ? allFilesResponse : (allFilesResponse.items || []);
-        const fileHashMap = {};
-        const fileByNameAndHash = new Map(); // Map for reusing existing files
-        const fileIdByDecodedName = new Map(); // Map to track file IDs by decoded name
-
-        for (const file of allFiles) {
-            if (file.hash) {
-                // Decode filename and check if it belongs to our directory
-                const decodedName = decodeFilename(file.meta.name, kbdirId);
-                if (decodedName !== null) {
-                    fileHashMap[decodedName] = file.hash;
-                    fileIdByDecodedName.set(decodedName, file.id);
-                    if (debug) console.log(`Remote file mapping: "${decodedName}" -> ${file.id} (hash: ${file.hash})`);
-                }
-
-                // Also build map for all files by name and hash for reuse
-                const key = `${file.meta.name}:${file.hash}`;
-                fileByNameAndHash.set(key, file);
-            }
-        }
-
-        // 4. Delete files from KB that belong to our kbdir_id but don't exist locally or have different hashes
-        if (debug) console.log('\nChecking for files to delete:');
+        const kbFilenameSet = new Set();
+        const kbFileById = new Map();
         for (const kbFile of kbFiles) {
-            // Decode filename and check if it belongs to our directory
             const filename = decodeFilename(kbFile.meta.name, kbdirId);
             if (filename !== null) {
-                // This file belongs to our directory
-                const localHash = localHashes[filename];
-                const remoteHash = fileHashMap[filename];
-
-                if (debug) {
-                    console.log(`\nEvaluating KB file: ${filename}`);
-                    console.log(`- Local hash: ${localHash || 'NOT FOUND LOCALLY'}`);
-                    console.log(`- Remote hash: ${remoteHash || 'UNKNOWN'}`);
-                    console.log(`- In local files list: ${localFiles.includes(filename) ? 'YES' : 'NO'}`);
-                }
-
-                if (!localFiles.includes(filename)) {
-                    // File doesn't exist locally anymore - delete it
-                    console.log(`Deleting file from knowledge base (no longer exists locally): ${filename}`);
-                    await removeFileFromKnowledgeBase(kbFile.id);
-                } else if (localHash !== remoteHash) {
-                    // File exists but has different hash - delete old version
-                    console.log(`Deleting file from knowledge base (content changed): ${filename}`);
-                    await removeFileFromKnowledgeBase(kbFile.id);
-                } else {
-                    console.log(`Keeping file (unchanged): ${filename}`);
-                }
-                // If localHash === remoteHash, file is up to date, keep it
-            } else {
-                console.log(`Skipping non-directory file: ${kbFile.meta.name}`);
+                kbFilenameSet.add(filename);
+                kbFileById.set(filename, kbFile);
             }
-            // If filename is null, this file doesn't belong to our directory, leave it alone
+        }
+
+        // On first run (no state), seed state from KB so we don't re-upload everything.
+        let stateUpdated = false;
+        if (!singleFile) {
+            for (const filename of kbFilenameSet) {
+                if (!(filename in syncState) && localHashes[filename]) {
+                    syncState[filename] = localHashes[filename];
+                    stateUpdated = true;
+                }
+            }
+        }
+
+        // 4. Delete files from KB that no longer exist locally
+        if (singleFile) {
+            if (debug) console.log('Skipping deletion step (single-file mode).');
+        }
+        for (const filename of singleFile ? [] : kbFilenameSet) {
+            if (!localFiles.includes(filename)) {
+                const kbFile = kbFileById.get(filename);
+                console.log(`${dryRun ? '[dry-run] Would delete' : 'Deleting'} file (no longer exists locally): ${filename}`);
+                if (!dryRun) {
+                    await removeFileFromKnowledgeBase(kbFile.id);
+                    delete syncState[filename];
+                    stateUpdated = true;
+                }
+            }
         }
 
         // 5. Upload and add new/changed files
-        if (debug) console.log('\nChecking for files to add or update:');
         for (const filename of localFiles) {
             const localHash = localHashes[filename];
-            const remoteHash = fileHashMap[filename];
+            const inKb = kbFilenameSet.has(filename);
+            const stateHash = syncState[filename];
+            const unchanged = inKb && stateHash === localHash;
 
             if (debug) {
-                console.log(`\nProcessing local file: ${filename}`);
-                console.log(`- Local hash: ${localHash}`);
-                console.log(`- Remote hash: ${remoteHash || 'NOT IN KB'}`);
+                console.log(`\nProcessing: ${filename}`);
+                console.log(`- inKb: ${inKb}, stateHash: ${stateHash || 'none'}, localHash: ${localHash}`);
             }
 
-            // Check if this file is already in the knowledge base with the correct content
-            const fileInKb = kbFiles.some(f => {
-                const decodedName = decodeFilename(f.meta.name, kbdirId);
-                return decodedName === filename;
-            });
-
-            if (debug) {
-                console.log(`- Already in knowledge base: ${fileInKb ? 'YES' : 'NO'}`);
-                console.log(`- Hash match: ${localHash === remoteHash ? 'YES' : 'NO'}`);
+            if (unchanged) {
+                if (debug) console.log(`Skipping (unchanged): ${filename}`);
+                continue;
             }
 
-            // Check if file needs to be uploaded.
-            // remoteHash is undefined when the server hasn't finished processing (hash: null),
-            // so skip re-upload in that case to avoid re-uploading already-linked files.
-            if (!fileInKb || (remoteHash !== undefined && localHash !== remoteHash)) {
-                let fileId = null;
-                const encodedFilename = encodeFilename(filename, kbdirId);
-                const reuseKey = `${encodedFilename}:${localHash}`;
+            if (dryRun) {
+                console.log(`[dry-run] Would ${!inKb ? 'upload (new)' : 'upload (changed)'}: ${filename}`);
+                continue;
+            }
 
-                // Check if we can reuse an existing file with same name and hash
-                const existingFile = fileByNameAndHash.get(reuseKey);
-                if (existingFile) {
-                    console.log(`Reusing existing file: ${filename} (${existingFile.id})`);
-                    fileId = existingFile.id;
-                } else {
-                    console.log(`Uploading file: ${filename}`);
-                    const uploadResult = await uploadFile(filename, kbdirId);
+            console.log(`Uploading file: ${filename}`);
+            const uploadResult = await uploadFile(filename, kbdirId);
 
-                    // Check if upload was successful
-                    if (!uploadResult || !uploadResult.id) {
-                        console.error(`Upload failed for ${filename}: No file ID in response`);
-                        console.error('Upload response:', JSON.stringify(uploadResult, null, 2));
-                        continue; // Skip this file
-                    }
+            if (!uploadResult || !uploadResult.id) {
+                console.error(`Upload failed for ${filename}: No file ID in response`);
+                console.error('Upload response:', JSON.stringify(uploadResult, null, 2));
+                continue;
+            }
 
-                    // Verify that the uploaded file's hash matches the local file's hash
-                    if (uploadResult.hash && uploadResult.hash !== localHash) {
-                        console.error(`Hash mismatch for uploaded file ${filename}:`);
-                        console.error(`  Local hash:    ${localHash}`);
-                        console.error(`  Uploaded hash: ${uploadResult.hash}`);
-                        console.error('This may indicate upload corruption or file processing issues - is that actually UTF-8?');
-                        // Continue with the process but log the issue
-                    }
-                    fileId = uploadResult.id;
-                    console.log(`File uploaded successfully: ${filename} (${fileId})`);
+            const fileId = uploadResult.id;
+            console.log(`File uploaded successfully: ${filename} (${fileId})`);
 
-                    // Wait for server-side processing to complete before adding to KB,
-                    // otherwise ChromaDB rejects null metadata values.
-                    if (uploadResult.hash === null) {
-                        console.log(`Waiting for file processing: ${filename}`);
-                        try {
-                            await waitForFileProcessing(fileId);
-                        } catch (e) {
-                            console.error(`Warning: ${e.message} — proceeding anyway`);
-                        }
-                    }
-                }
-
-                // Add file to knowledge base
-                console.log(`Adding file to knowledge base: ${filename}`);
+            // Wait for server-side processing to complete before adding to KB
+            if (uploadResult.hash === null) {
+                console.log(`Waiting for file processing: ${filename}`);
                 try {
-                    const addResult = await httpRequest('POST', `/api/v1/knowledge/${knowledgeBaseId}/file/add`, {
-                        file_id: fileId
-                    });
+                    await waitForFileProcessing(fileId);
+                } catch (e) {
+                    console.error(`Warning: ${e.message} — proceeding anyway`);
+                }
+            }
 
-                    // Check if adding to knowledge base was successful
-                    if (!addResult?.id) {
+            // Add file to knowledge base
+            console.log(`Adding file to knowledge base: ${filename}`);
+            try {
+                const addResult = await httpRequest('POST', `/api/v1/knowledge/${knowledgeBaseId}/file/add`, {
+                    file_id: fileId
+                });
+
+                if (!addResult?.id) {
+                    const detail = addResult?.detail || '';
+                    if (detail.includes('Duplicate content')) {
+                        console.warn(`Skipping ${filename}: duplicate content already exists in knowledge base`);
+                        syncState[filename] = localHash;
+                        stateUpdated = true;
+                    } else {
                         console.error(`Failed to add file to knowledge base: ${filename}`);
                         console.error('Add response:', JSON.stringify(addResult, null, 2));
-
-                        // If we uploaded the file (didn't reuse), delete it to save space
-                        if (!existingFile) {
-                            console.log(`Cleaning up uploaded file: ${filename} (${fileId})`);
-                            await httpRequest('DELETE', `/api/v1/files/${fileId}`);
-                        }
-                        continue;
-                    }
-
-                    console.log(`File added to knowledge base successfully: ${filename}`);
-                } catch (err) {
-                    console.error(`Failed to add file to knowledge base: ${filename}`, err.message);
-
-                    // If we uploaded the file (didn't reuse), delete it to save space
-                    if (!existingFile) {
                         console.log(`Cleaning up uploaded file: ${filename} (${fileId})`);
                         await httpRequest('DELETE', `/api/v1/files/${fileId}`);
                     }
+                    continue;
                 }
-            } else {
-                console.log(`Skipping file (unchanged and already in KB): ${filename}`);
+
+                console.log(`File added to knowledge base successfully: ${filename}`);
+                syncState[filename] = localHash;
+                stateUpdated = true;
+
+                // Periodically save state so interrupted syncs preserve progress
+                if (stateUpdated && Object.keys(syncState).length % 50 === 0) {
+                    fs.writeFileSync(statePath, JSON.stringify(syncState, null, 2));
+                }
+            } catch (err) {
+                console.error(`Failed to add file to knowledge base: ${filename}`, err.message);
+                console.log(`Cleaning up uploaded file: ${filename} (${fileId})`);
+                await httpRequest('DELETE', `/api/v1/files/${fileId}`);
             }
+        }
+
+        if (!dryRun && stateUpdated) {
+            fs.writeFileSync(statePath, JSON.stringify(syncState, null, 2));
         }
 
         console.log('Synchronization completed successfully!');
@@ -492,7 +519,9 @@ if (command === 'sync') {
         console.error('kbdir_id is required for sync command.');
         process.exit(1);
     }
-    syncKnowledgeBase();
+    const dryRun = args.includes('--dry-run');
+    const singleFile = args.slice(1).find(a => a !== '--dry-run') || null;
+    syncKnowledgeBase(singleFile, dryRun);
 } else if (command === 'listkb') {
     listKnowledgeBases();
 } else if (command === 'listfiles') {

@@ -53,6 +53,27 @@ response = requests.post(url, headers=headers, files=files)
 return response.json()
 ```
 
+## Checking File Processing Status
+
+File uploads are processed asynchronously. Before adding a file to a knowledge base, confirm processing has completed using the dedicated status endpoint.
+
+Endpoint: GET /api/v1/files/{id}/process/status
+
+Query parameters:
+- `stream` (boolean, default: false) — if true, returns a Server-Sent Events stream
+
+Status values:
+- `pending` — still processing
+- `completed` — finished successfully  
+- `failed` — processing failed (response includes `error` field)
+
+Curl Example:
+
+```shell
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  http://localhost:3000/api/v1/files/7fcf9108-d769-4ce5-bf0f-5b57c3462ebb/process/status
+```
+
 ## Getting a list of uploaded files
 
 GET /api/v1/files/

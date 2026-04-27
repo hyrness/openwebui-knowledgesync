@@ -129,4 +129,5 @@ Temporary Items
 
 # project specific ignores
 .open-webui-knowledgesync
+.sync-state
 hpsx*
